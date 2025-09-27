@@ -1,0 +1,19 @@
+# Python 缓存
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+
+# 虚拟环境
+.venv/
+venv/
+
+# 日志和临时文件
+*.log
+*.tmp
+
+# Jupyter Notebook 检查点
+.ipynb_checkpoints/
+
+# 环境配置
+.env
