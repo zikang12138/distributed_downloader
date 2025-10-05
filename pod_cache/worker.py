@@ -112,8 +112,35 @@ def ring_order_pods(logical_path: str, pods: list[str]) -> list[str]:
         return hashlib.md5(f"{logical_path}|{p}".encode("utf-8")).hexdigest()
     return sorted(pods, key=score)
 
-def ensure_preheat_set():
-    pass
+def ensure_preheat_set(r, logical_path: str, ordered_pods: list[str]):
+    """固定 K 个预热副本：加锁后将前 K 个 Pod 写入 preheat set（带 TTL）。"""
+    file_md5 = hashlib.md5(logical_path.encode("utf-8")).hexdigest()
+    set_key = PREHEAT_SET_TMPL.format(file_md5=file_md5)
+    local_key = PREHEAT_LOCK_TMPL.format(file_md5=file_md5)
+    # 若已有集合且数量>=K，则直接返回
+    try:
+        n = r.scard(set_key)
+        if n >= PREHEAT_K:
+            return
+    except Exception:
+        pass
+    
+    # 分布式互斥，避免并发挑选
+    if r.set(local_key, "1", nx=True, ex=10):
+        try:
+            # 避免重复写
+            n2 = r.scard(set_key)
+            if n2 is None or n2 < PREHEAT_K:
+                targets = ordered_pods[:PREHEAT_K]
+                if targets:
+                    r.sadd(set_key, *targets)
+                    r.expire(set_key, PREHEAT_TTL_SEC)
+        finally:
+            r.delete(local_key)
+    return set_key
+
+
+
 def try_download_via_pods(r, logical_path, dest_path):
     """按“健康 -> 占位 -> 下载”的流程尝试所有“新鲜 pod”"""
     pods = get_fresh_pods(r)
@@ -121,9 +148,15 @@ def try_download_via_pods(r, logical_path, dest_path):
         print("[worker] no fresh pods available")
         return False, "no pods"
     
+    # 一致性哈希
+    pods = ring_order_pods(logical_path, pods)
+
     # 预加载 Lua 脚本
     reserve_sha = r.script_load(RESERVE_LUA)
     release_sha = r.script_load(RELEASE_LUA)
+
+    # 固定 K 个预热副本
+    ensure_preheat_set(r, logical_path, pods)
 
     hostname = socket.gethostname()
 
@@ -162,7 +195,10 @@ def try_download_via_pods(r, logical_path, dest_path):
             if success:
                 return True, None
             else:
-                print(f"[worker] error via pod {pod_id}: {err}")
+                if err == "425-preheat-required":
+                    print(f"[worker] pod {pod_id} not authorized to preheat; try next")
+                else:
+                    print(f"[worker] error via pod {pod_id}: {err}")
         finally:
             # 释放占位
             r.evalsha(release_sha, 1, busy_key, token)
